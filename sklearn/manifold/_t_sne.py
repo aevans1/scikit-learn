@@ -181,7 +181,6 @@ def _kl_divergence(
     dist += 1.0
     dist **= (degrees_of_freedom + 1.0) / -2.0
     Q = np.maximum(dist / (2.0 * np.sum(dist)), MACHINE_EPSILON)
-
     # Optimization trick below: np.dot(x, y) is faster than
     # np.sum(x * y) because it calls BLAS
 
@@ -200,9 +199,96 @@ def _kl_divergence(
     grad = grad.ravel()
     c = 2.0 * (degrees_of_freedom + 1.0) / degrees_of_freedom
     grad *= c
-
     return kl_divergence, grad
 
+def _lukes_grads(
+    params,
+    P,
+    degrees_of_freedom,
+    n_samples,
+    n_components,
+    skip_num_points=0,
+    compute_error=True,
+):
+    """t-SNE objective function: gradient of the KL divergence
+    of p_ijs and q_ijs and the absolute error.
+
+    Parameters
+    ----------
+    params : ndarray of shape (n_params,)
+        Unraveled embedding.
+
+    P : ndarray of shape (n_samples * (n_samples-1) / 2,)
+        Condensed joint probability matrix.
+
+    degrees_of_freedom : int
+        Degrees of freedom of the Student's-t distribution.
+
+    n_samples : int
+        Number of samples.
+
+    n_components : int
+        Dimension of the embedded space.
+
+    skip_num_points : int, default=0
+        This does not compute the gradient for points with indices below
+        `skip_num_points`. This is useful when computing transforms of new
+        data where you'd like to keep the old data fixed.
+
+    compute_error: bool, default=True
+        If False, the kl_divergence is not computed and returns NaN.
+
+    Returns
+    -------
+    grad : ndarray of shape (n_params,)
+        Unraveled gradient of the Kullback-Leibler divergence with respect to
+        the embedding.
+    """
+    X_embedded = params.reshape(n_samples, n_components)
+
+    # Q is a heavy-tailed distribution: Student's t-distribution
+    dist = pdist(X_embedded, "sqeuclidean")
+    dist /= degrees_of_freedom
+    dist += 1.0
+    dist **= (degrees_of_freedom + 1.0) / -2.0
+    Z = np.sum(dist)
+    Q = np.maximum(dist / (2.0 * np.sum(dist)), MACHINE_EPSILON)
+    dist = squareform(dist)
+
+    Q = squareform(Q)
+    # Optimization trick below: np.dot(x, y) is faster than
+    # np.sum(x * y) because it calls BLAS
+    # pdist always returns double precision distances. Thus we need to take
+    attractive = np.ndarray((n_samples, n_components), dtype=params.dtype)
+    attractive_alt = np.ndarray((n_samples, n_components), dtype=params.dtype)
+    repulsive = np.ndarray((n_samples, n_components), dtype=params.dtype)
+
+    print("changing P to non-sparse matrix")
+    P = P.toarray()
+    PQ_attract = P*Q
+    PQ_repulse = Q*Q
+    PQ_alt = P.dot(Q)
+    print("got specalized matrices")
+    print(X_embedded[0, :])
+    print(X_embedded.shape)
+    for i in range(n_samples):
+        attractive[i, :] = -1*np.dot(PQ_attract[i, :], X_embedded[i, :] - X_embedded)
+        repulsive[i, :] = np.dot(PQ_repulse[i, :], X_embedded[i, :] - X_embedded)
+        attractive_alt[i, :] = -1*np.dot(PQ_alt[i, :], X_embedded[i, :] - X_embedded)
+    #attractive = attractive.ravel()
+    #repulsive = repulsive.ravel()
+    print("computed forces") 
+    grad = np.ndarray((n_samples, n_components), dtype=params.dtype)
+    PQd = (P - Q)*Q
+    print("PQd somcputed")
+    for i in range(skip_num_points, n_samples):
+        grad[i, :] = np.dot(PQd[i, :], X_embedded[i, :] - X_embedded)
+    #grad = grad.ravel()
+    print("grad computed")
+    attractive *=Z
+    repulsive *=Z
+    attractive_alt *=Z
+    return attractive, repulsive, attractive_alt
 
 def _kl_divergence_bh(
     params,
@@ -1077,6 +1163,11 @@ class TSNE(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             opt_args["n_iter_without_progress"] = self.n_iter_without_progress
             params, kl_divergence, it = _gradient_descent(obj_func, params, **opt_args)
 
+        # Lukes added code
+        print("Luke's check for attractive repulsive:")
+        #lukes_args = [P, degrees_of_freedom, n_samples, self.n_components]
+        attractive, repulsive, attractive_alt = _lukes_grads(params, P, degrees_of_freedom, n_samples, self.n_components)
+
         # Save the final number of iterations
         self.n_iter_ = it
 
@@ -1089,7 +1180,7 @@ class TSNE(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         X_embedded = params.reshape(n_samples, self.n_components)
         self.kl_divergence_ = kl_divergence
 
-        return X_embedded
+        return X_embedded, attractive, repulsive, attractive_alt
 
     @_fit_context(
         # TSNE.metric is not validated yet
